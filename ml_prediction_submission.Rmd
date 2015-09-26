@@ -1,0 +1,192 @@
+---
+title: "Machine Learning Coursera Project - Barbell Lift Prediction Analysis"
+author: "DCoz"
+date: "September 26, 2015"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+
+## Synopsis
+The focus of this project was to predict whether a small, select group of individuals performed barbell lifts properly by analyzing sensor data captured by wearable devices.  The participants were asked to perform barbell lifts correctly, then, incorrectly using 5 different techniques.  As part of this study, data was made available that includes sensor data output for each of the 6 individuals and the associated "Class" which captures how the lift was actually performed.  A record in the dataset with ClassA indicates that the lift was performed perfectly; however, Classes B->E indicate that there was a specific problem with the participant's technique.
+
+Here is a breakdown of the Class outcomes captured in the data:
+
+- Class A : lift performed perfectly
+- Class B : incorrect, throwing elbows ot the front
+- Class C : incorrect, lifting the dumbbell only 1/2 way
+- Class D : incorrect, lowered the dubmbell only 1/2 way
+- Class E : incorrect, threw hips to the front
+
+This submission will focus on building various types of machine learning models, then, ultimately using these models to predict how dumbbell lifts were performed without knowing the outcome (i.e. Class A->E)
+
+## Data Preparation
+Training data for this project was captured here:
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+First, capture the training data, and perform NA data transformation for empty strings, division by zero, and NA values:
+```{r training_data_capture, cache=TRUE}
+library(RCurl)
+library(caret)
+trainURL <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+train <- read.csv(url(trainURL), na.strings=c("NA","#DIV/0!",""))
+```
+
+In order to speed up model building, turn on various parallel processing capabilities:
+
+```{r turn_on_parallelism}
+library(parallel, quietly=T)
+library(doParallel, quietly=T)
+cluster <- makeCluster(detectCores())
+registerDoParallel(cluster)
+```
+
+Now, remove near zero covariates since these provide little to no predictive power.  This also enables more efficient construction of predictive models.
+```{r remove_nz_covariates, cache=TRUE, warning=FALSE}
+library(caret)
+nsv <- nearZeroVar(train,saveMetrics = FALSE)
+train <- train[,-nsv]
+```
+
+Next, remove unique row ids/sequences and participant names since they are not predictors of how well someone is performing a barbell lift.  Furthermore, remove timsestamps since WHEN an activity was performed is not a predictor of proper
+lifting technique.
+```{r remove_metadata_fields}
+train <- train[,-(1:6)]
+```
+
+In addition to the removal of contextual "metadata" fields, only include columns that have <= 1% NAs since these will provide greatest predictive power.
+```{r remove_greater_than_1_percent_nas}
+train <- train[, colMeans(is.na(train)) <= .01]
+```
+
+Lastly, partition the training data such that 60% of the data will be used for training models and 40% for model testing/evaluation.
+```{r partition_training_and_testing_data, message=FALSE, warning=FALSE}
+library(caret)
+inTrain <- createDataPartition(y=train$classe, p=.60, list=FALSE)
+newTraining <- train[inTrain,]
+newTesting <- train[-inTrain,]
+rm(train)
+```
+
+## Model Creation and Evaluation
+
+### CART Approach
+First, I chose to build a classfication/decision tree using caret's 'rpart' method.  I specifically used 7-fold cross validation, and repeated 3 times.
+```{r cart_model, cache=TRUE}
+set.seed(12345)
+
+train_control <- trainControl(method="cv", number=7, repeats=3)
+cartModel <- train(classe ~., 
+                   data=newTraining, 
+                   trControl=train_control, 
+                   method="rpart")
+```
+
+Next, I rendered a decision tree of this model using the "rattle" package to better understand how the model was constructed.
+```{r cart_decision_tree, cache=TRUE, echo=FALSE, warning=FALSE}
+library(rattle)
+fancyRpartPlot(cartModel$finalModel)
+```
+
+Finally, I evaluated the model against the 40% testing data to determine the accuracy/out of sample error.  Unfortunately, this classification tree approach yielded very low accuracy (~57%), and, conversely, high out of sample error = ~43% (equal to 100% - accuracy of 57% = 43%).  At this point, I turned to other modeling techniques for better accuracy.
+```{r cart_prediction, cache=TRUE}
+set.seed(12345)
+cartPredictions <- predict(cartModel, newdata=newTesting)
+confusionMatrix(cartPredictions,newTesting$classe)
+```
+
+### Random Forests Approach
+
+Next, I chose to pursue the Random Forests approach given that class lectures and various web sources indicated that this model tends to lead to high accuracy.  In order to build this model in a reasonable timefreame, I lowered the number of trees considered to 20 from the default and set mtry=5.  As you will see, these setting still yielded a high degress of accuracy.
+
+```{r build_random_forests_model, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(12345)
+# RANDOM FORESTS APPROACH
+train_control <- trainControl(method="none",verboseIter = TRUE) 
+rfGrid <- expand.grid(mtry=5)
+rfModel <- train(classe ~., 
+                 data=newTraining, 
+                 method="parRF",
+                 tuneGrid=rfGrid,
+                 ntree=20,
+                 trControl=train_control
+                 )
+predictions <- predict(rfModel$finalModel, newTesting)
+```
+
+The confusion matrix below highlights the fact that the overall accuracy is ~99%; therefore, the out-of-sample error is ~1%.  The Random Forests model clearly performed much better than the CART approach.  Furthermore, there is an included  table that highlights where the model got predictions correct, and where it failed to predict properly.  Predicting Class C appears to be the most problematic with 34 incorrect predictions in contrast to Class E which was predicted most accurately (only 2 incorrect predictions).  Perhaps, most important, when the model predicted that people were lifting propery (Class A), the model predicted this with 99% accuracy (only 20 out of 2246 predictions were incorrect).
+```{r build_random_forests_confusion_matrix_and_table, message=FALSE, warning=FALSE, cache=TRUE}
+confusionMatrix(predictions,newTesting$classe)
+```
+
+### Bagging Approach
+
+Although the Random Forests model was quite accurate, I decided to gain experience with Bagging to see if it might perform even better.  My final conclusion was that the model accuracy was just slightly less than Random Forests, but significantly better than the initial CART approach that I chose.
+
+First, I built the "Tree Bag" model:
+```{r build_bagging_model, cache=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(12345)
+
+# BAGGING APPROACH
+train_control <- trainControl(method="cv",
+                              number=2,
+                              verboseIter = TRUE) 
+bagModel <- train(classe ~.,
+                  data=newTraining,
+                  method="treebag",
+                  trControl=train_control)
+```
+
+Next, I used the model to predict outcomes for the 40% test data allocation that I reserved.  As you can see below, the accuracy of the Tree Bagging model was just slightly below 99% (specifically, 98.55%); therefore, the out-of-sample error was ~1.5% (just slightly worse than Random Forests).
+
+```{r bagging_prediction_and_evaluation, cache=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+predictions <- predict(bagModel$finalModel, newTesting)
+confusionMatrix(predictions,newTesting$classe)
+```
+
+### Final Testing
+
+The final step of this analysis was to use the various predictive models (CART, Random Forests, Tree Bag) created to generate predictions for the test data captured @:
+
+http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+Given that we transformed the training data in multiple ways, it was necessary to apply the same transformation to the final test data.  See below for data capture and data transformations:
+```{r transform_final_test_data, cache=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+finalTestURL <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+finalTest <- read.csv(url(finalTestURL), na.strings=c("NA","#DIV/0!",""))
+finalNsv <- nearZeroVar(finalTest,saveMetrics = FALSE)
+finalTest <- finalTest[,-nsv]
+finalTest <- finalTest[,-(1:6)]
+finalTest <- finalTest[, colMeans(is.na(finalTest)) <= .01]
+```
+
+Next, I generated and reviewed predictions on the final test data using all 3 models evaluated.  As you can see, "Random Forests" and "Tree Bag" models generated the same outcomes, and, given their high accuracy levels on predicting training data, I chose to submit these results for this project (these answers were deemed correct after submission).
+```{r predict_and_evaluate_models_on_final_test_data , cache=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+rfFinalPredictions <- predict(rfModel$finalModel, finalTest)
+rfFinalPredictions
+bagFinalPredictions <- predict(rfModel$finalModel, finalTest)
+bagFinalPredictions
+cartFinalPredictions <- predict(cartModel, finalTest)
+cartFinalPredictions
+
+# Turn of parallelism
+stopCluster(cluster)
+```
+
+Here's the code that I used to submit my answers.  The answers vector was built off of the results generated above by Random Forests (which are the same as Tree Bagging).
+```{r answer_submission, cache=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+#answers=c("B","A","B","A","A","E","D","B","A","A","B","C","B","A","E","E","A","B","B","B")
+
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("problem_id_",i,".txt")
+        write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+    }
+}
+
+pml_write_files(rfFinalPredictions)
+```
+
+
